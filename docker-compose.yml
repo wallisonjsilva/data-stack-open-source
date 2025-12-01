@@ -1,0 +1,200 @@
+services:
+  # ---------------------------------------------------------------------------
+  # 1. STORAGE LAYER (MinIO)
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio
+    container_name: datalake-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      # Use apenas estas duas para definir o admin
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+    command: server /data --console-address ":9001"
+    volumes:
+      - ./data/minio:/data
+    networks:
+      - data-network
+
+  # ---------------------------------------------------------------------------
+  # 2. METADATA UNIFICADA (Postgres para Hive e Airflow)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:13
+    container_name: metadata-db
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+      # O DB padrão 'postgres' é criado, os outros criamos via script
+    ports:
+      - "5432:5432"
+    volumes:
+      # O segredo: Esse script roda na primeira vez e cria os bancos 'airflow' e 'metastore'
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - data-network
+
+  # ---------------------------------------------------------------------------
+  # 3. EVENT STREAMING (Kafka)
+  # ---------------------------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - data-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092" # Porta para o (Host) conectar
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Configuração chata, mas necessária para conectar de fora do Docker
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - data-network
+
+  # ---------------------------------------------------------------------------
+  # 4. METADATA LAYER (Hive Metastore & DBs)
+  # ---------------------------------------------------------------------------
+  # O Serviço do Catálogo (Hive Metastore)
+  hive-metastore:
+    image: apache/hive:4.0.1
+    container_name: hive-metastore
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      # Apontando para o container 'postgres' e banco 'metastore'
+      SERVICE_OPTS: 
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver 
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/metastore 
+        -Djavax.jdo.option.ConnectionUserName=hive 
+        -Djavax.jdo.option.ConnectionPassword=password
+    ports:
+      - "9083:9083" # Porta Thrift (Spark e Trino usam essa)
+    depends_on:
+      - postgres
+    networks:
+      - data-network
+    volumes:
+      - ./jars/postgresql-42.7.5.jar:/opt/hive/lib/postgres.jar
+    # Comando para inicializar o schema do Hive no primeiro boot
+    command: /bin/bash -c "/opt/hive/bin/schematool -dbType postgres -initSchema && /opt/hive/bin/hive --service metastore"
+
+  # ---------------------------------------------------------------------------
+  # 5. PROCESSING LAYER (Spark + Iceberg Support)
+  # ---------------------------------------------------------------------------
+  spark:
+    image: tabulario/spark-iceberg:latest
+    container_name: processing-spark
+    environment:
+      - SPARK_DRIVER_MEMORY=4G
+      - SPARK_EXECUTOR_MEMORY=4G
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      - AWS_S3_ENDPOINT=http://minio:9000
+    ports:
+      - "8888:8888" # Jupyter Lab
+      - "8081:8081" # Spark UI
+    volumes:
+      - ./dags:/home/iceberg/notebooks/dags # Compartilha scripts
+    depends_on:
+      - minio
+      - hive-metastore
+    networks:
+      - data-network
+
+  # ---------------------------------------------------------------------------
+  # 6. SERVING LAYER (Trino)
+  # ---------------------------------------------------------------------------
+  trino:
+    image: trinodb/trino:latest
+    container_name: serving-trino
+    ports:
+      - "8080:8080" # Interface SQL e Web UI do Trino
+    environment:
+      - JVM_MAX_HEAP_SIZE=8G # Aproveitando seus 32GB
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog # Onde fica a config do Iceberg
+    depends_on:
+      - minio
+      - hive-metastore
+    networks:
+      - data-network
+
+  # ---------------------------------------------------------------------------
+  # 7. ORCHESTRATION LAYER (Airflow)
+  # ---------------------------------------------------------------------------
+  airflow-init:
+    image: apache/airflow:2.7.1
+    container_name: airflow-init
+    command: version
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      # Conecta no container 'postgres', banco 'airflow', usuario 'airflow'
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
+      - _AIRFLOW_DB_UPGRADE=true
+      - _AIRFLOW_WWW_USER_CREATE=true
+      - _AIRFLOW_WWW_USER_USERNAME=admin
+      - _AIRFLOW_WWW_USER_PASSWORD=admin
+    depends_on:
+      - postgres
+    networks:
+      - data-network
+
+  airflow-webserver:
+    image: apache/airflow:2.7.1
+    container_name: orchestration-webserver
+    command: webserver
+    restart: always
+    ports:
+      - "8085:8080" # Porta 8085 para não conflitar com Trino (8080)
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - data-network
+
+  airflow-scheduler:
+    image: apache/airflow:2.7.1
+    container_name: orchestration-scheduler
+    command: scheduler
+    restart: always
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+    depends_on:
+      - airflow-webserver
+    networks:
+      - data-network
+
+# Rede interna para eles conversarem
+networks:
+  data-network:
+    driver: bridge
